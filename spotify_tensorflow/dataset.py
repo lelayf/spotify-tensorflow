@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright 2017 Spotify AB.
+# Copyright 2017-2019 Spotify AB.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,154 +18,534 @@
 
 from __future__ import absolute_import, division, print_function
 
-import multiprocessing as mp
+import logging
+from typing import Tuple, Union, Dict, Iterator  # noqa: F401
 
+import six
+import numpy as np  # noqa: F401
+import pandas as pd
 import tensorflow as tf
-from tensorflow.python.lib.io import file_io
+from spotify_tensorflow.tf_schema_utils import parse_schema_file, schema_to_feature_spec
+from tensorflow_metadata.proto.v0.schema_pb2 import Schema  # noqa: F401
 
 
-class DatasetContext(object):
-    """Holds additional information about/from Dataset parsing.
-
-    Attributes:
-        filenames_placeholder: A placeholder for Dataset file inputs.
-        num_features: Number of features available in the Dataset.
-    """
-
-    def __init__(self, filenames_placeholder, num_features):
-        self.filenames_placeholder = filenames_placeholder
-        self.num_features = num_features
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class Datasets(object):
-    _default_feature_desc_filename = "_feature_desc"
 
     @staticmethod
-    def get_parse_proto_function(feature_desc_path, feature_mapping_fn):
-        """Get a function to parse `Example` proto using given features specifications.
+    def _assert_eager(endpoint):
+        assert tf.executing_eagerly(), "Eager execution is required for a %s endpoint! " \
+                                       "Add this add the begining of your main:\n\nimport " \
+                                       "tensorflow as tf\ntf.enable_eager_execution()\n\n" % \
+                                       endpoint
 
-        Args:
-            feature_desc_path: filepath to a feature description file.
-            feature_mapping_fn: A function which maps feature spec line to `FixedLenFeature` or
-                `VarLenFeature` values.
-
-        Returns:
-            A Tuple of two elements: (number of features, parse function). Parse function takes a
-            single element - a scalar string Tensor, a single serialized Example.
+    @classmethod
+    def parse_schema(cls, schema_path):
+        # type: (str) -> Tuple[Dict[str, Union[tf.FixedLenFeature, tf.VarLenFeature, tf.SparseFeature]], Schema]  # noqa: E501
         """
-        assert isinstance(feature_desc_path, str), \
-            "dir_path is not a String: %r" % feature_desc_path
-        assert file_io.file_exists(feature_desc_path), \
-            "feature desc `%s` does not exist" % feature_desc_path
+        Returns TensorFlow Feature Spec and parsed tf.metadata Schema for given tf.metadata Schema.
 
-        def get_features(fpath):
-            features = {}
-            with file_io.FileIO(fpath, "r") as f:
-                for feature_spec_line in f.readlines():
-                    feature_spec_line = feature_spec_line.strip()
-                    features[feature_spec_line] = feature_mapping_fn(feature_spec_line)
-            return features
+        :param schema_path: tf.metadata Schema path
+        """
+        schema = parse_schema_file(schema_path)
+        return schema_to_feature_spec(schema), schema
 
-        feature_spec = get_features(feature_desc_path)
+    @classmethod
+    def parse_schema_from_stats(cls, stats_path):
+        # type: (str) -> Tuple[Dict[str, Union[tf.FixedLenFeature, tf.VarLenFeature, tf.SparseFeature]], Schema]  # noqa: E501
+        """
+        Returns TensorFlow Feature Spec and parsed tf.metadata Schema for given tf.metadata
+        DatasetFeatureStatisticsList.
 
-        def _parse_function(example_proto):
-            return tf.parse_single_example(example_proto, feature_spec)
+        :param stats_path: tf.metadata DatasetFeatureStatisticsList path
+        """
+        import tensorflow_data_validation as tfdv
+        stats = tfdv.load_statistics(stats_path)
+        schema = tfdv.infer_schema(stats)
+        return schema_to_feature_spec(schema), schema
 
-        return len(feature_spec), _parse_function
-
-    @staticmethod
-    def get_featran_example_dataset(dir_path,
-                                    feature_desc_path=None,
-                                    feature_mapping_fn=None,
-                                    num_threads=mp.cpu_count(),
-                                    num_threads_per_file=mp.cpu_count(),
-                                    block_length=32,
-                                    compression_type="ZLIB"):
+    @classmethod
+    def examples_via_schema(cls,
+                            file_pattern,  # type: str
+                            schema_path,  # type: str
+                            compression_type=None,  # type: str
+                            batch_size=128,  # type: int
+                            shuffle=True,  # type: bool
+                            num_epochs=1,  # type: int
+                            shuffle_buffer_size=10000,  # type: int
+                            shuffle_seed=None,  # type: int
+                            prefetch_buffer_size=1,  # type: int
+                            reader_num_threads=1,  # type: int
+                            parser_num_threads=2,  # type: int
+                            sloppy_ordering=False,  # type: bool
+                            drop_final_batch=False  # type: bool
+                            ):
+        # type: (...) -> tf.data.Dataset
         """Get `Dataset` of parsed `Example` protos.
 
-        Args:
-            dir_path: Directory path containing features.
-            feature_desc_path: Filepath to feature description file. Default is `_feature_desc`
-                inside `dir_path`.
-            feature_mapping_fn: A function which maps feature spec line to `FixedLenFeature` or
-                `VarLenFeature` values. Default maps all features to
-                tf.FixedLenFeature((), tf.int64, default_value=0).
-            compression_type: A `tf.string` scalar evaluating to one of `""` (no compression)
-                `"ZLIB"`, or `"GZIP"`.
-            num_threads: A `tf.int32` scalar or `tf.Tensor`, represents number of files to process
-                concurrently.
-            num_threads_per_file: A `tf.int32` scalar or `tf.Tensor`, represents number of threads
-                used concurrently per file.
-            block_length: A `tf.int32` scalar or `tf.Tensor`, represents buffer size for results
-                from any of the parsing threads.
+        :param file_pattern: List of files or patterns of file paths containing
+                             `Example` records. See `tf.gfile.Glob` for pattern rules
+        :param schema_path: tf.metadata Schema path
+        :param compression_type: TFRecord compression type, see `tf.data.TFRecordDataset` doc
+        :param batch_size: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param shuffle: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param num_epochs: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param shuffle_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param shuffle_seed: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param prefetch_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param reader_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param parser_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param sloppy_ordering: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param drop_final_batch: see `tensorflow.contrib.data.make_batched_features_dataset` doc
 
-        Returns:
-            A Tuple of two elements: (dataset, dataset_context). First element is a `Dataset`, which
-            holds results of the parsing of `Example` protos. Second element holds a
-            `DatasetContext` (see doc of `DatasetContext`).
+        :return `Dataset`, which holds results of the parsing of `Example` protos
         """
-        assert isinstance(dir_path, str), "dir_path is not a String: %r" % dir_path
-        assert isinstance(feature_desc_path, str) or feature_desc_path is None, \
-            "dir_path is not a String: %r" % feature_desc_path
-        assert file_io.file_exists(dir_path), "directory `%s` does not exist" % dir_path
-        assert file_io.is_directory(dir_path), "`%s` is not a directory" % dir_path
-        if feature_desc_path:
-            assert file_io.file_exists(feature_desc_path), \
-                "feature desc `%s` does not exist" % feature_desc_path
+        return cls._examples(file_pattern,
+                             schema_path=schema_path,
+                             compression_type=compression_type,
+                             batch_size=batch_size,
+                             shuffle=shuffle,
+                             num_epochs=num_epochs,
+                             shuffle_buffer_size=shuffle_buffer_size,
+                             shuffle_seed=shuffle_seed,
+                             prefetch_buffer_size=prefetch_buffer_size,
+                             reader_num_threads=reader_num_threads,
+                             parser_num_threads=parser_num_threads,
+                             sloppy_ordering=sloppy_ordering,
+                             drop_final_batch=drop_final_batch)
 
-        from os.path import join as pjoin
-        flist = file_io.list_directory(dir_path)
-        input_files = [pjoin(dir_path, x) for x in filter(lambda f: not f.startswith("_"), flist)]
-        feature_desc_path = feature_desc_path or Datasets.__get_default_feature_desc_path(dir_path)
-        filenames = tf.placeholder_with_default(input_files, shape=[None])
-        feature_mapping_fn = feature_mapping_fn or Datasets.__get_default_feature_mapping_fn()
-        num_features, parse_fn = Datasets.get_parse_proto_function(feature_desc_path,
-                                                                   feature_mapping_fn)
-        dataset = tf.data.Dataset.from_tensor_slices(filenames)
-        # TODO(rav): does `map` need to be inside `interleave`, what are the performance diff?
-        dataset = dataset.interleave(lambda f: tf.data.TFRecordDataset(f, compression_type),
-                                     cycle_length=num_threads,
-                                     block_length=block_length)
-        dataset = dataset.map(parse_fn, num_parallel_calls=num_threads_per_file)
-        return dataset, DatasetContext(filenames_placeholder=filenames, num_features=num_features)
+    @classmethod
+    def examples_via_feature_spec(cls,
+                                  file_pattern,  # type: str
+                                  feature_spec,  # type: Dict[str, Union[tf.FixedLenFeature, tf.VarLenFeature, tf.SparseFeature]]  # noqa: E501
+                                  compression_type=None,  # type: str
+                                  batch_size=128,  # type: int
+                                  shuffle=True,  # type: bool
+                                  num_epochs=1,  # type: int
+                                  shuffle_buffer_size=10000,  # type: int
+                                  shuffle_seed=None,  # type: int
+                                  prefetch_buffer_size=1,  # type: int
+                                  reader_num_threads=1,  # type: int
+                                  parser_num_threads=2,  # type: int
+                                  sloppy_ordering=False,  # type: bool
+                                  drop_final_batch=False  # type: bool
+                                  ):
+        # type: (...) -> tf.data.Dataset
+        """Get `Dataset` of parsed `Example` protos.
 
-    @staticmethod
-    def __get_default_feature_mapping_fn():
-        return lambda l: tf.FixedLenFeature((), tf.int64, default_value=0)
+        :param file_pattern: List of files or patterns of file paths containing
+                             `Example` records. See `tf.gfile.Glob` for pattern rules
+        :param feature_spec: TensorFlow feature spec
+        :param compression_type: TFRecord compression type, see `tf.data.TFRecordDataset` doc
+        :param batch_size: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param shuffle: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param num_epochs: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param shuffle_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param shuffle_seed: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param prefetch_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param reader_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param parser_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param sloppy_ordering: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+        :param drop_final_batch: see `tensorflow.contrib.data.make_batched_features_dataset` doc
 
-    @staticmethod
-    def __get_default_feature_desc_path(dir_path):
-        from os.path import join as pjoin
-        return pjoin(dir_path, Datasets._default_feature_desc_filename)
-
-    @staticmethod
-    def mk_dataset_training(training_data_dir, feature_mapping_fn):
-        """Make a training `Dataset`.
-
-        Args:
-            training_data_dir: a directory contains training data.
-
-        Returns:
-            A `Dataset` that should be used for training purposes.
+        :return `Dataset`, which holds results of the parsing of `Example` protos
         """
-        with tf.name_scope("training-input"):
-            train_dataset, _ = Datasets.get_featran_example_dataset(
-                training_data_dir,
-                feature_mapping_fn=feature_mapping_fn)
-            return train_dataset
+        return cls._examples(file_pattern,
+                             feature_spec=feature_spec,
+                             compression_type=compression_type,
+                             batch_size=batch_size,
+                             shuffle=shuffle,
+                             num_epochs=num_epochs,
+                             shuffle_buffer_size=shuffle_buffer_size,
+                             shuffle_seed=shuffle_seed,
+                             prefetch_buffer_size=prefetch_buffer_size,
+                             reader_num_threads=reader_num_threads,
+                             parser_num_threads=parser_num_threads,
+                             sloppy_ordering=sloppy_ordering,
+                             drop_final_batch=drop_final_batch)
 
-    @staticmethod
-    def mk_dataset_eval(eval_data_dir, feature_mapping_fn):
-        """Make an evaluation `Dataset`.
+    @classmethod
+    def _examples(cls,
+                  file_pattern,  # type: str
+                  schema_path=None,  # type: str
+                  feature_spec=None,  # type: Dict[str, Union[tf.FixedLenFeature, tf.VarLenFeature, tf.SparseFeature]]  # noqa: E501
+                  compression_type=None,  # type: str
+                  batch_size=128,  # type: int
+                  shuffle=True,  # type: bool
+                  num_epochs=1,  # type: int
+                  shuffle_buffer_size=10000,  # type: int
+                  shuffle_seed=None,  # type: int
+                  prefetch_buffer_size=1,  # type: int
+                  reader_num_threads=1,  # type: int
+                  parser_num_threads=2,  # type: int
+                  sloppy_ordering=False,  # type: bool
+                  drop_final_batch=False  # type: bool
+                  ):
+        # type: (...) -> tf.data.Dataset
 
-        Args:
-            eval_data_dir: a directory contains evaluation data.
+        if schema_path:
+            feature_spec, _ = cls.parse_schema(schema_path)
 
-        Returns:
-            A `Dataset` that should be used for evaluation purposes.
-        """
-        with tf.name_scope("evaluation-input"):
-            eval_dataset, _ = Datasets.get_featran_example_dataset(
-                eval_data_dir,
-                feature_mapping_fn=feature_mapping_fn)
-            return eval_dataset
+        logger.debug("Will parse features from: `%s`, using features spec: %s",
+                     file_pattern,
+                     str(feature_spec))
+
+        from tensorflow.contrib.data import make_batched_features_dataset
+        reader_args = [compression_type] if compression_type else None
+        dataset = make_batched_features_dataset(file_pattern,
+                                                batch_size=batch_size,
+                                                features=feature_spec,
+                                                reader_args=reader_args,
+                                                num_epochs=num_epochs,
+                                                shuffle=shuffle,
+                                                shuffle_buffer_size=shuffle_buffer_size,
+                                                shuffle_seed=shuffle_seed,
+                                                prefetch_buffer_size=prefetch_buffer_size,
+                                                reader_num_threads=reader_num_threads,
+                                                parser_num_threads=parser_num_threads,
+                                                sloppy_ordering=sloppy_ordering,
+                                                drop_final_batch=drop_final_batch)
+        return dataset
+
+    class __DictionaryEndpoint(object):
+
+        @classmethod
+        def examples_via_schema(cls,
+                                file_pattern,  # type: str
+                                schema_path,  # type: str
+                                default_value=0,  # type: float
+                                batch_size=128,  # type: int
+                                compression_type=None,  # type: str
+                                shuffle=True,  # type: bool
+                                num_epochs=1,  # type: int
+                                shuffle_buffer_size=10000,  # type: int
+                                shuffle_seed=42,  # type: int
+                                prefetch_buffer_size=1,  # type: int
+                                reader_num_threads=1,  # type: int
+                                parser_num_threads=2,  # type: int
+                                sloppy_ordering=False,  # type: bool
+                                drop_final_batch=False  # type: bool
+                                ):
+            # type: (...) -> Iterator[Dict[str, np.ndarray]]
+            """
+            Read a TF dataset and load it into a dictionary of NumPy Arrays.
+
+            :param file_pattern: List of files or patterns of file paths containing
+                                 `Example` records. See `tf.gfile.Glob` for pattern rules
+            :param default_value: Value used if a sparse feature is missing.
+            :param schema_path: tf.metadata Schema path
+            :param compression_type: TFRecord compression type, see `tf.data.TFRecordDataset` doc
+            :param batch_size: batch size, set to the size of the dataset to read all data at once
+            :param shuffle: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param num_epochs: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param shuffle_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                        doc
+            :param shuffle_seed: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param prefetch_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                         doc
+            :param reader_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                       doc
+            :param parser_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                       doc
+            :param sloppy_ordering: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param drop_final_batch: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+
+            :return Dictionary of NumPy arrays
+            """
+            return cls._examples(file_pattern=file_pattern,
+                                 schema_path=schema_path,
+                                 default_value=default_value,
+                                 batch_size=batch_size,
+                                 compression_type=compression_type,
+                                 shuffle=shuffle,
+                                 num_epochs=num_epochs,
+                                 shuffle_buffer_size=shuffle_buffer_size,
+                                 shuffle_seed=shuffle_seed,
+                                 prefetch_buffer_size=prefetch_buffer_size,
+                                 reader_num_threads=reader_num_threads,
+                                 parser_num_threads=parser_num_threads,
+                                 sloppy_ordering=sloppy_ordering,
+                                 drop_final_batch=drop_final_batch)
+
+        @classmethod
+        def examples_via_feature_spec(cls,
+                                      file_pattern,  # type: str
+                                      feature_spec,  # type: Dict[str, Union[tf.FixedLenFeature, tf.VarLenFeature, tf.SparseFeature]]  # noqa: E501
+                                      default_value=0,  # type: float
+                                      batch_size=128,  # type: int
+                                      compression_type=None,  # type: str
+                                      shuffle=True,  # type: bool
+                                      num_epochs=1,  # type: int
+                                      shuffle_buffer_size=10000,  # type: int
+                                      shuffle_seed=42,  # type: int
+                                      prefetch_buffer_size=1,  # type: int
+                                      reader_num_threads=1,  # type: int
+                                      parser_num_threads=2,  # type: int
+                                      sloppy_ordering=False,  # type: bool
+                                      drop_final_batch=False  # type: bool
+                                      ):
+            # type: (...) -> Iterator[Dict[str, np.ndarray]]
+            """
+            Read a TF dataset and load it into a dictionary of NumPy Arrays.
+
+            :param file_pattern: List of files or patterns of file paths containing
+                                 `Example` records. See `tf.gfile.Glob` for pattern rules
+            :param feature_spec: TensorFlow feature spec
+            :param default_value: Value used if a sparse feature is missing.
+            :param compression_type: TFRecord compression type, see `tf.data.TFRecordDataset` doc
+            :param batch_size: batch size, set to the size of the dataset to read all data at once
+            :param shuffle: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param num_epochs: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param shuffle_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                        doc
+            :param shuffle_seed: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param prefetch_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                         doc
+            :param reader_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                       doc
+            :param parser_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                       doc
+            :param sloppy_ordering: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param drop_final_batch: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+
+            :return Dictionary of NumPy arrays
+            """
+            return cls._examples(file_pattern=file_pattern,
+                                 feature_spec=feature_spec,
+                                 default_value=default_value,
+                                 batch_size=batch_size,
+                                 compression_type=compression_type,
+                                 shuffle=shuffle,
+                                 num_epochs=num_epochs,
+                                 shuffle_buffer_size=shuffle_buffer_size,
+                                 shuffle_seed=shuffle_seed,
+                                 prefetch_buffer_size=prefetch_buffer_size,
+                                 reader_num_threads=reader_num_threads,
+                                 parser_num_threads=parser_num_threads,
+                                 sloppy_ordering=sloppy_ordering,
+                                 drop_final_batch=drop_final_batch)
+
+        @classmethod
+        def _examples(cls,
+                      file_pattern,  # type: str
+                      schema_path=None,  # type: str
+                      feature_spec=None,  # type: Dict[str, Union[tf.FixedLenFeature, tf.VarLenFeature, tf.SparseFeature]]  # noqa: E501
+                      default_value=0,  # type: float
+                      compression_type=None,  # type: str
+                      batch_size=128,  # type: int
+                      shuffle=True,  # type: bool
+                      num_epochs=1,  # type: int
+                      shuffle_buffer_size=10000,  # type: int
+                      shuffle_seed=None,  # type: int
+                      prefetch_buffer_size=1,  # type: int
+                      reader_num_threads=1,  # type: int
+                      parser_num_threads=2,  # type: int
+                      sloppy_ordering=False,  # type: bool
+                      drop_final_batch=False  # type: bool
+                      ):
+            # type: (...) -> Iterator[Dict[str, np.ndarray]]
+            Datasets._assert_eager("Dictionary")
+
+            def get_numpy(tensor):
+                if isinstance(tensor, tf.Tensor):
+                    return tensor.numpy()
+                elif isinstance(tensor, tf.SparseTensor):
+                    # If it's a SparseTensor, which is the representation of VarLenFeature and
+                    # SparseFeature, we convert it to dense representation, and further is it's
+                    # a scalar, we reshape to to a vector
+
+                    shape = tensor.dense_shape.numpy()
+                    # first element is batch size
+                    if shape[1] == 0:
+                        # this feature is not defined for any of the examples in the batch
+                        return np.repeat(default_value, shape[0])
+
+                    numpy_dense = tf.sparse_tensor_to_dense(tensor,
+                                                            default_value=default_value).numpy()
+                    if shape[1] == 1:
+                        # this is scalar feature, reshape to a vector
+                        return numpy_dense.reshape(shape[0])
+                    else:
+                        return numpy_dense
+                else:
+                    raise ValueError("This type %s is not supported!", type(tensor).__name__)
+
+            dataset = Datasets._examples(file_pattern=file_pattern,
+                                         schema_path=schema_path,
+                                         feature_spec=feature_spec,
+                                         compression_type=compression_type,
+                                         batch_size=batch_size,
+                                         shuffle=shuffle,
+                                         num_epochs=num_epochs,
+                                         shuffle_buffer_size=shuffle_buffer_size,
+                                         shuffle_seed=shuffle_seed,
+                                         prefetch_buffer_size=prefetch_buffer_size,
+                                         reader_num_threads=reader_num_threads,
+                                         parser_num_threads=parser_num_threads,
+                                         sloppy_ordering=sloppy_ordering,
+                                         drop_final_batch=drop_final_batch)
+            for batch in dataset:
+                yield {name: get_numpy(eager_tensor) for name, eager_tensor in six.iteritems(batch)}
+
+    dict = __DictionaryEndpoint()
+
+    class __DataFrameEndpoint(object):
+
+        @classmethod
+        def examples_via_schema(cls,
+                                file_pattern,  # type: str
+                                schema_path,  # type: str
+                                default_value=0,  # type: float
+                                batch_size=128,  # type: int
+                                compression_type=None,  # type: str
+                                shuffle=True,  # type: bool
+                                num_epochs=1,  # type: int
+                                shuffle_buffer_size=10000,  # type: int
+                                shuffle_seed=42,  # type: int
+                                prefetch_buffer_size=1,  # type: int
+                                reader_num_threads=1,  # type: int
+                                parser_num_threads=2,  # type: int
+                                sloppy_ordering=False,  # type: bool
+                                drop_final_batch=False  # type: bool
+                                ):
+            # type: (...) -> Iterator[pd.DataFrame]
+            """
+            Read a TF dataset in batches, each one yields a Pandas DataFrame.
+
+            :param file_pattern: List of files or patterns of file paths containing
+                                 `Example` records. See `tf.gfile.Glob` for pattern rules
+            :param schema_path: tf.metadata Schema path
+            :param default_value: Value used if a sparse feature is missing.
+            :param batch_size: batch size, set to the size of the dataset to read all data at once
+            :param compression_type: TFRecord compression type, see `tf.data.TFRecordDataset` doc
+            :param shuffle: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param num_epochs: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param shuffle_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                        doc
+            :param shuffle_seed: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param prefetch_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                         doc
+            :param reader_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                       doc
+            :param parser_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                       doc
+            :param sloppy_ordering: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param drop_final_batch: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+
+            :return A Python Generator, yielding batches of data in a Pandas DataFrame
+            """
+            return cls._examples(file_pattern=file_pattern,
+                                 schema_path=schema_path,
+                                 default_value=default_value,
+                                 batch_size=batch_size,
+                                 compression_type=compression_type,
+                                 shuffle=shuffle,
+                                 num_epochs=num_epochs,
+                                 shuffle_buffer_size=shuffle_buffer_size,
+                                 shuffle_seed=shuffle_seed,
+                                 prefetch_buffer_size=prefetch_buffer_size,
+                                 reader_num_threads=reader_num_threads,
+                                 parser_num_threads=parser_num_threads,
+                                 sloppy_ordering=sloppy_ordering,
+                                 drop_final_batch=drop_final_batch)
+
+        @classmethod
+        def examples_via_feature_spec(cls,
+                                      file_pattern,  # type: str
+                                      feature_spec,  # type: Dict[str, Union[tf.FixedLenFeature, tf.VarLenFeature, tf.SparseFeature]]  # noqa: E501
+                                      default_value=0,  # type: float
+                                      batch_size=128,  # type: int
+                                      compression_type=None,  # type: str
+                                      shuffle=True,  # type: bool
+                                      num_epochs=1,  # type: int
+                                      shuffle_buffer_size=10000,  # type: int
+                                      shuffle_seed=42,  # type: int
+                                      prefetch_buffer_size=1,  # type: int
+                                      reader_num_threads=1,  # type: int
+                                      parser_num_threads=2,  # type: int
+                                      sloppy_ordering=False,  # type: bool
+                                      drop_final_batch=False  # type: bool
+                                      ):
+            # type: (...) -> Iterator[pd.DataFrame]
+            """
+            Read a TF dataset in batches, each one yields a Pandas DataFrame.
+
+            :param file_pattern: List of files or patterns of file paths containing
+                                 `Example` records. See `tf.gfile.Glob` for pattern rules
+            :param feature_spec: TensorFlow feature spec
+            :param default_value: Value used if a sparse feature is missing.
+            :param batch_size: batch size, set to the size of the dataset to read all data at once
+            :param compression_type: TFRecord compression type, see `tf.data.TFRecordDataset` doc
+            :param shuffle: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param num_epochs: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param shuffle_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                        doc
+            :param shuffle_seed: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param prefetch_buffer_size: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                         doc
+            :param reader_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                       doc
+            :param parser_num_threads: see `tensorflow.contrib.data.make_batched_features_dataset`
+                                       doc
+            :param sloppy_ordering: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+            :param drop_final_batch: see `tensorflow.contrib.data.make_batched_features_dataset` doc
+
+            :return A Python Generator, yielding batches of data in a Pandas DataFrame
+            """
+            return cls._examples(file_pattern=file_pattern,
+                                 feature_spec=feature_spec,
+                                 default_value=default_value,
+                                 batch_size=batch_size,
+                                 compression_type=compression_type,
+                                 shuffle=shuffle,
+                                 num_epochs=num_epochs,
+                                 shuffle_buffer_size=shuffle_buffer_size,
+                                 shuffle_seed=shuffle_seed,
+                                 prefetch_buffer_size=prefetch_buffer_size,
+                                 reader_num_threads=reader_num_threads,
+                                 parser_num_threads=parser_num_threads,
+                                 sloppy_ordering=sloppy_ordering,
+                                 drop_final_batch=drop_final_batch)
+
+        @classmethod
+        def _examples(cls,
+                      file_pattern,  # type: str
+                      schema_path=None,  # type: str
+                      feature_spec=None,  # type: Dict[str, Union[tf.FixedLenFeature, tf.VarLenFeature, tf.SparseFeature]]  # noqa: E501
+                      default_value=0,  # type: float
+                      compression_type=None,  # type: str
+                      batch_size=128,  # type: int
+                      shuffle=True,  # type: bool
+                      num_epochs=1,  # type: int
+                      shuffle_buffer_size=10000,  # type: int
+                      shuffle_seed=None,  # type: int
+                      prefetch_buffer_size=1,  # type: int
+                      reader_num_threads=1,  # type: int
+                      parser_num_threads=2,  # type: int
+                      sloppy_ordering=False,  # type: bool
+                      drop_final_batch=False  # type: bool
+                      ):
+            # type: (...) -> Iterator[pd.DataFrame]
+            Datasets._assert_eager("DataFrame")
+            dataset = Datasets.dict._examples(file_pattern=file_pattern,
+                                              schema_path=schema_path,
+                                              default_value=default_value,
+                                              feature_spec=feature_spec,
+                                              compression_type=compression_type,
+                                              batch_size=batch_size,
+                                              shuffle=shuffle,
+                                              num_epochs=num_epochs,
+                                              shuffle_buffer_size=shuffle_buffer_size,
+                                              shuffle_seed=shuffle_seed,
+                                              prefetch_buffer_size=prefetch_buffer_size,
+                                              reader_num_threads=reader_num_threads,
+                                              parser_num_threads=parser_num_threads,
+                                              sloppy_ordering=sloppy_ordering,
+                                              drop_final_batch=drop_final_batch)
+            for d in dataset:
+                yield pd.DataFrame(data=d)
+
+    dataframe = __DataFrameEndpoint()

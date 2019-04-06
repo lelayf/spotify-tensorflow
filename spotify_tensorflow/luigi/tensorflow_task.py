@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright 2017 Spotify AB.
+# Copyright 2017-2019 Spotify AB.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,14 +20,12 @@ from __future__ import absolute_import, division, print_function
 
 import getpass
 import logging
-import subprocess
-import sys
+import uuid
 
 import luigi
-from luigi.contrib.gcs import GCSFlagTarget, GCSTarget
+from luigi.contrib.gcs import GCSFlagTarget
 from luigi.local_target import LocalTarget
-
-from .utils import is_gcs_path
+from spotify_tensorflow.luigi.utils import is_gcs_path, get_uri, run_with_logging
 
 logger = logging.getLogger("luigi-interface")
 
@@ -44,26 +42,43 @@ class TensorFlowTask(luigi.Task):
     region = None               The GCP region if running with ml-engine, e.g. europe-west1
     model_name_suffix = None    A string suffix representing the model name, which will be appended
                                 to the job name.
+    runtime_version = None      The Google Cloud ML Engine runtime version for this job. Defaults to
+                                the latest stable version. See
+                                https://cloud.google.com/ml/docs/concepts/runtime-version-list for a
+                                list of accepted versions.
+    scale_tier = None           Specifies the machine types, the number of replicas for workers and
+                                parameter servers. SCALE_TIER must be one of:
+                                    basic, basic-gpu, basic-tpu, custom, premium-1, standard-1.
 
     Also, you can specify command line arguments for your trainer by overriding the
     `def tf_task_args(self)` method.
     """
 
     # Task properties
-    model_package = None
-    model_name = None
-    gcp_project = None
-    region = None
-    model_name_suffix = None
+    model_name = luigi.Parameter(description="Name of the python model file")
+    model_package = luigi.Parameter(description="Python package containing your model")
+    model_package_path = luigi.Parameter(description="Absolute path to the model package")
+    gcp_project = luigi.Parameter(description="GCP project", default=None)
+    region = luigi.Parameter(description="GCP region", default=None)
+    model_name_suffix = luigi.Parameter(description="String which will be appended to the job"
+                                                    " name. Useful for finding jobs in the"
+                                                    " ml-engine UI.", default=None)
 
     # Task parameters
     cloud = luigi.BoolParameter(description="Run on ml-engine")
     blocking = luigi.BoolParameter(default=True, description="Run in stream-logs/blocking mode")
     job_dir = luigi.Parameter(description="A job directory, used to store snapshots, logs and any "
-                                          "other artifacts. A trailing '/' is not required.")
+                                          "other artifacts. A trailing '/' is required for "
+                                          "'gs://' paths.")
     ml_engine_conf = luigi.Parameter(default=None,
                                      description="An ml-engine YAML configuration file.")
     tf_debug = luigi.BoolParameter(default=False, description="Run tf on debug mode")
+    runtime_version = luigi.Parameter(default=None,
+                                      description="The Google Cloud ML Engine runtime version "
+                                      "for this job.")
+    scale_tier = luigi.Parameter(default=None,
+                                 description="Specifies the machine types, the number of replicas "
+                                             "for workers and parameter servers.")
 
     def __init__(self, *args, **kwargs):
         super(TensorFlowTask, self).__init__(*args, **kwargs)
@@ -75,19 +90,16 @@ class TensorFlowTask(luigi.Task):
     def run(self):
         cmd = self._mk_cmd()
         logger.info("Running:\n```\n%s\n```", cmd)
-        ret = subprocess.call(cmd, shell=True)
-        if ret != 0:
-            logger.error("Training failed. Aborting.")
-            sys.exit(ret)
+        run_with_logging(cmd, logger)
         logger.info("Training successful. Marking as done.")
         self._success_hook()
 
     def output(self):
-        if is_gcs_path(self.get_job_dir()):
-            return GCSFlagTarget(self.get_job_dir())
-        else:
-            # assume local filesystem otherwise
-            return LocalTarget(self.get_job_dir())
+        """
+        Generate Target dynamically based on `self.get_job_dir()`.
+        """
+        job_dir = str(self.get_job_dir())
+        return GCSFlagTarget(job_dir) if is_gcs_path(job_dir) else LocalTarget(job_dir)
 
     # TODO(rav): look into luigi hooks
     def _success_hook(self):
@@ -101,19 +113,19 @@ class TensorFlowTask(luigi.Task):
             open(success_file, "a").close()
 
     def _mk_cmd(self):
-        cmd = ["gcloud ml-engine"]
+        cmd = ["gcloud", "ml-engine"]
         if self.cloud:
             cmd.extend(self._mk_cloud_params())
         else:
-            cmd.append("local train")
+            cmd.extend(["local", "train"])
 
         cmd.extend(self._get_model_args())
 
         if self.tf_debug:
-            cmd += ["--verbosity=debug"]
+            cmd.append("--verbosity=debug")
 
         cmd.extend(self._get_job_args())
-        return " ".join(cmd)
+        return cmd
 
     def get_job_dir(self):
         """Get job directory used to store snapshots, logs, final output and any other artifacts."""
@@ -123,10 +135,9 @@ class TensorFlowTask(luigi.Task):
         params = []
         if self.gcp_project:
             params.append("--project=%s" % self.gcp_project)
-        import uuid
-        params.append("jobs submit training %s_%s_%s" % (getpass.getuser(),
-                                                         self.__class__.__name__,
-                                                         str(uuid.uuid4()).replace("-", "_")))
+
+        params.extend(["jobs", "submit", "training", self._get_job_name()])
+
         if self.region:
             params.append("--region=%s" % self.region)
         if self.ml_engine_conf:
@@ -134,16 +145,22 @@ class TensorFlowTask(luigi.Task):
         params.append("--job-dir=%s" % self.get_job_dir())
         if self.blocking:
             params.append("--stream-logs")  # makes the execution "blocking"
+        if self.runtime_version:
+            params.append("--runtime-version=%s" % self.runtime_version)
+        if self.scale_tier:
+            params.append("--scale-tier=%s" % self.scale_tier)
         return params
 
     def _get_model_args(self):
         args = []
-        if self.model_package:
-            package_path = "/".join(__import__(self.model_package).__file__.split("/")[:-1])
-            args.append("--package-path=%s" % package_path)
+        if self.model_package_path:
+            args.append("--package-path=%s" % self.model_package_path)
         if self.model_name:
-            args.append("--module-name={package}.{module}".format(package=self.model_package,
-                                                                  module=self.model_name))
+            module_name = self.model_name
+            if self.model_package:
+                module_name = "{package}.{module}".format(package=self.model_package,
+                                                          module=module_name)
+            args.append("--module-name=" + module_name)
         return args
 
     def _get_job_args(self):
@@ -154,15 +171,23 @@ class TensorFlowTask(luigi.Task):
         args.extend(self.tf_task_args())
         return args
 
+    def _get_job_name(self):
+        job_name = "%s_%s_%s" % (getpass.getuser(), self.__class__.__name__,
+                                 str(uuid.uuid4()).replace("-", "_"))
+        return job_name
+
     def _get_input_args(self):
+        # TODO(brianm): this doesn't work when subclass yields from `requires`
         job_input = self.input()
         if isinstance(job_input, luigi.Target):
             job_input = {"input": job_input}
+        if len(job_input) == 0:  # default requires()
+            return []
         if not isinstance(job_input, dict):
             raise ValueError("Input (requires()) must be dict type")
         input_args = []
-        for (name, targets) in job_input.iteritems():
-            uris = [self._get_uri(target) for target in luigi.task.flatten(targets)]
+        for (name, targets) in job_input.items():
+            uris = [get_uri(target) for target in luigi.task.flatten(targets)]
             if isinstance(targets, dict):
                 # If targets is a dict that means it had multiple outputs. In this case make the
                 # input args "<input key>-<task output key>"
@@ -173,12 +198,3 @@ class TensorFlowTask(luigi.Task):
                 input_args.append("--%s=%s" % (arg_name, uri))
 
         return input_args
-
-    @staticmethod
-    def _get_uri(target):
-        if hasattr(target, "uri"):
-            return target.uri()
-        elif isinstance(target, (GCSTarget, GCSFlagTarget)):
-            return target.path
-        else:
-            raise ValueError("Unsupported input Target type: %s" % target.__class__.__name__)
